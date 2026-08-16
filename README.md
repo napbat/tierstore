@@ -129,6 +129,10 @@ graduate into a real tier once we're happy with it.
   mmap-backed `Bytes`: zero-copy reads, snapshot-on-overwrite, and RAM
   residency managed by the kernel's page cache (evictable under pressure) —
   shardstore's warm-tier model.
+- **Keep useful warm data:** bounded mmap tiers default to FIFO for
+  compatibility and accept `.with_eviction(Eviction::Lru)` for access-aware
+  retention. `MmapDiskTier::stats()` reports entries, mapped entries, disk
+  bytes, budget, and lifetime eviction totals without touching mapped pages.
 - **Bound concurrency:** wrap an origin in `LimitedTier` to cap in-flight
   operations against it; transient fill memory becomes ~`limit × value
   size` instead of `callers × value size`. Single-flight already dedupes
@@ -160,8 +164,9 @@ let cache = TieredCache::builder()
   cache layers, and invalidation clears local copies while the origin
   re-serves the key afterwards (resurrection by design for data you don't
   own).
-- **Disk is bounded**: `MmapDiskTier::open_bounded` FIFO-evicts over its
-  byte budget, rebuilds accounting from file sizes/mtimes on restart, and
+- **Disk is bounded**: `MmapDiskTier::open_bounded` evicts over its byte
+  budget (FIFO by default, or LRU with `.with_eviction(Eviction::Lru)`),
+  rebuilds accounting from file sizes/mtimes on restart, and
   serves displaced values zero-copy from the evicted files themselves.
 - **Partial reads**: `TierReadRange::read_range` serves byte ranges without
   materialising whole values (a positional read on `DiskTier`, a refcounted

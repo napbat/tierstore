@@ -6,20 +6,7 @@ use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use tierstore_core::{Displaced, Page, Tier, TierList, TierRead, TierReadRef, TierWrite};
-
-/// Eviction ordering for [`MemoryTier`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Eviction {
-    /// Evict in insertion order; reads do not affect eviction. Replacing a
-    /// value keeps its queue position.
-    #[default]
-    Fifo,
-    /// Evict the least recently *used* entry: reads (`get`, `get_many`,
-    /// `get_ref`) and replacements refresh recency. Existence checks do
-    /// not.
-    Lru,
-}
+use tierstore_core::{Displaced, Eviction, Page, Tier, TierList, TierRead, TierReadRef, TierWrite};
 
 /// A shared in-memory map with optional entry-count and byte-budget bounds
 /// and FIFO or LRU eviction.

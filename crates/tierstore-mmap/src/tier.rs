@@ -12,7 +12,9 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
-use tierstore_core::{Displaced, Page, Tier, TierList, TierRead, TierReadRange, TierWrite};
+use tierstore_core::{
+    Displaced, Eviction, Page, Tier, TierList, TierRead, TierReadRange, TierWrite,
+};
 
 /// File-per-key tier serving mmap-backed, kernel-evictable [`Bytes`].
 ///
@@ -22,7 +24,30 @@ use tierstore_core::{Displaced, Page, Tier, TierList, TierRead, TierReadRange, T
 pub struct MmapDiskTier {
     root: PathBuf,
     budget: Option<NonZeroU64>,
+    eviction: Eviction,
     inner: Mutex<Inner>,
+}
+
+/// Point-in-time mmap-tier residency and eviction counters.
+///
+/// The byte and entry fields describe the live on-disk cache. Mappings are
+/// opened lazily after restart and stay cheap-clone, kernel-evictable views;
+/// `mapped_entries` therefore reports address-space mappings, not resident
+/// physical RAM. Eviction totals are lifetime counters since open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmapDiskStats {
+    /// Live cache entries on disk.
+    pub entries: usize,
+    /// Entries with a currently retained read-only mapping.
+    pub mapped_entries: usize,
+    /// Accounted live bytes on disk.
+    pub disk_bytes: u64,
+    /// Configured byte budget, or `None` for an unbounded tier.
+    pub budget_bytes: Option<u64>,
+    /// Entries evicted to enforce the budget since this tier was opened.
+    pub evictions: u64,
+    /// Bytes evicted to enforce the budget since this tier was opened.
+    pub evicted_bytes: u64,
 }
 
 #[derive(Default)]
@@ -33,10 +58,87 @@ struct Inner {
     maps: HashMap<String, Bytes>,
     /// Accounted on-disk size per key.
     sizes: HashMap<String, u64>,
-    /// FIFO eviction order (rebuilt from mtimes on reopen).
-    order: VecDeque<String>,
+    /// Eviction queue of `(key, stamp)` tickets. A ticket is live iff its
+    /// stamp matches `stamps`; LRU touches append a new ticket and make the
+    /// old one stale, preserving amortised O(1) access updates.
+    order: VecDeque<(String, u64)>,
+    /// Current live eviction ticket stamp per key.
+    stamps: HashMap<String, u64>,
     /// Sum of accounted sizes.
     total: u64,
+    /// Next monotonically increasing queue ticket.
+    next_stamp: u64,
+    /// Lifetime budget-eviction counters since open.
+    evictions: u64,
+    evicted_bytes: u64,
+}
+
+impl Inner {
+    fn fresh_stamp(&mut self) -> u64 {
+        self.next_stamp = self.next_stamp.wrapping_add(1);
+        if self.next_stamp == 0 {
+            // A wrap after 2^64 touches is practically unreachable, but
+            // rebuilding keeps ticket identity correct without relying on it.
+            self.rebuild_tickets();
+            self.next_stamp = self.stamps.len() as u64 + 1;
+        }
+        self.next_stamp
+    }
+
+    fn insert_ticket(&mut self, key: String) {
+        let stamp = self.fresh_stamp();
+        self.stamps.insert(key.clone(), stamp);
+        self.order.push_back((key, stamp));
+        self.compact_tickets();
+    }
+
+    fn touch(&mut self, key: &str) {
+        if self.sizes.contains_key(key) {
+            self.insert_ticket(key.to_owned());
+        }
+    }
+
+    fn remove_accounting(&mut self, key: &str) -> Option<u64> {
+        self.maps.remove(key);
+        self.stamps.remove(key);
+        let size = self.sizes.remove(key)?;
+        self.total = self.total.saturating_sub(size);
+        Some(size)
+    }
+
+    fn pop_oldest(&mut self) -> Option<String> {
+        while let Some((key, stamp)) = self.order.pop_front() {
+            if self.stamps.get(&key).is_some_and(|live| *live == stamp) {
+                return Some(key);
+            }
+        }
+        None
+    }
+
+    fn compact_tickets(&mut self) {
+        if self.order.len() > self.sizes.len().saturating_mul(2).max(16) {
+            let stamps = &self.stamps;
+            self.order
+                .retain(|(key, stamp)| stamps.get(key).is_some_and(|live| live == stamp));
+        }
+    }
+
+    fn rebuild_tickets(&mut self) {
+        let mut live = Vec::with_capacity(self.stamps.len());
+        for (key, stamp) in &self.order {
+            if self.stamps.get(key).is_some_and(|current| current == stamp) {
+                live.push(key.clone());
+            }
+        }
+        self.order.clear();
+        self.stamps.clear();
+        for (index, key) in live.into_iter().enumerate() {
+            let stamp = index as u64 + 1;
+            self.stamps.insert(key.clone(), stamp);
+            self.order.push_back((key, stamp));
+        }
+        self.next_stamp = self.stamps.len() as u64;
+    }
 }
 
 impl fmt::Debug for MmapDiskTier {
@@ -45,6 +147,7 @@ impl fmt::Debug for MmapDiskTier {
         f.debug_struct("MmapDiskTier")
             .field("root", &self.root)
             .field("budget", &self.budget)
+            .field("eviction", &self.eviction)
             .field("entries", &inner.sizes.len())
             .field("disk_usage", &inner.total)
             .finish_non_exhaustive()
@@ -62,8 +165,9 @@ impl MmapDiskTier {
     }
 
     /// Opens a byte-bounded tier: puts that push the accounted total over
-    /// `budget` FIFO-evict the oldest entries and return them as displaced,
-    /// mapped from the evicted files themselves — zero-copy demotion.
+    /// `budget` evict the oldest entries and return them as displaced,
+    /// mapped from the evicted files themselves — zero-copy demotion. The
+    /// default ordering is FIFO; opt into LRU with [`Self::with_eviction`].
     ///
     /// # Errors
     ///
@@ -78,8 +182,20 @@ impl MmapDiskTier {
         Ok(Self {
             root,
             budget,
+            eviction: Eviction::Fifo,
             inner: Mutex::new(inner),
         })
+    }
+
+    /// Selects the eviction ordering for this tier.
+    ///
+    /// The default is [`Eviction::Fifo`] for compatibility. LRU touches are
+    /// tracked in memory with stamped tickets; after restart, file mtimes
+    /// provide the initial oldest-to-newest approximation.
+    #[must_use]
+    pub const fn with_eviction(mut self, eviction: Eviction) -> Self {
+        self.eviction = eviction;
+        self
     }
 
     /// The tier's root directory.
@@ -92,6 +208,20 @@ impl MmapDiskTier {
     #[must_use]
     pub fn disk_usage(&self) -> u64 {
         self.lock().total
+    }
+
+    /// Returns a cheap point-in-time residency and eviction snapshot.
+    #[must_use]
+    pub fn stats(&self) -> MmapDiskStats {
+        let inner = self.lock();
+        MmapDiskStats {
+            entries: inner.sizes.len(),
+            mapped_entries: inner.maps.len(),
+            disk_bytes: inner.total,
+            budget_bytes: self.budget.map(NonZeroU64::get),
+            evictions: inner.evictions,
+            evicted_bytes: inner.evicted_bytes,
+        }
     }
 
     /// Drops every entry: files are unlinked and the accounting resets.
@@ -110,6 +240,7 @@ impl MmapDiskTier {
         inner.maps.clear();
         inner.sizes.clear();
         inner.order.clear();
+        inner.stamps.clear();
         inner.total = 0;
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
@@ -151,8 +282,8 @@ impl MmapDiskTier {
     }
 }
 
-/// Rebuilds accounting from the directory: sizes from file lengths, FIFO
-/// order approximated by mtime.
+/// Rebuilds accounting from the directory: sizes from file lengths and the
+/// initial oldest-to-newest eviction order approximated by mtime.
 fn scan(root: &Path) -> io::Result<Inner> {
     let mut found = Vec::new();
     for entry in fs::read_dir(root)? {
@@ -177,7 +308,7 @@ fn scan(root: &Path) -> io::Result<Inner> {
     for (key, len, _) in found {
         inner.total = inner.total.saturating_add(len);
         inner.sizes.insert(key.clone(), len);
-        inner.order.push_back(key);
+        inner.insert_ticket(key);
     }
     Ok(inner)
 }
@@ -214,15 +345,33 @@ impl Tier for MmapDiskTier {
 impl TierRead for MmapDiskTier {
     async fn get(&self, key: &String) -> io::Result<Option<Bytes>> {
         // Bind before branching so the map lock is not held past the probe.
-        let cached = self.lock().maps.get(key).cloned();
+        let cached = {
+            let mut inner = self.lock();
+            let cached = inner.maps.get(key).cloned();
+            if cached.is_some() && matches!(self.eviction, Eviction::Lru) {
+                inner.touch(key);
+            }
+            cached
+        };
         if let Some(bytes) = cached {
             return Ok(Some(bytes));
         }
         // Map outside the lock; a racing get may map the same file twice,
         // which is benign (both mappings are valid, last insert wins).
-        Ok(Self::map_file(&self.path_for(key))?.inspect(|bytes| {
-            self.lock().maps.insert(key.clone(), bytes.clone());
-        }))
+        let mapped = Self::map_file(&self.path_for(key))?;
+        if let Some(bytes) = &mapped {
+            let mut inner = self.lock();
+            // A concurrent delete may have unlinked the path after it was
+            // mapped. Return this snapshot to the in-flight reader, but do
+            // not resurrect it in the retained mapping/accounting index.
+            if inner.sizes.contains_key(key) {
+                inner.maps.insert(key.clone(), bytes.clone());
+                if matches!(self.eviction, Eviction::Lru) {
+                    inner.touch(key);
+                }
+            }
+        }
+        Ok(mapped)
     }
 
     async fn exists(&self, key: &String) -> io::Result<bool> {
@@ -262,7 +411,7 @@ impl TierWrite for MmapDiskTier {
     /// Writes via temp-file-then-rename, then remaps: the cached value is
     /// file-backed, so the caller's (anonymous-RAM) input can be dropped
     /// and residency shifts to evictable page cache immediately. Under a
-    /// budget, overflow FIFO-evicts oldest entries and returns them.
+    /// budget, overflow evicts in the configured order and returns them.
     async fn put(&self, key: String, value: Bytes) -> io::Result<Displaced<String, Bytes>> {
         let path = self.path_for(&key);
         // Hex names contain no `.`, so the temp name cannot collide with a
@@ -279,15 +428,17 @@ impl TierWrite for MmapDiskTier {
         if let Some(bytes) = mapped {
             inner.maps.insert(key.clone(), bytes);
         }
-        if let Some(old) = inner.sizes.insert(key.clone(), len) {
+        let replaced = inner.sizes.insert(key.clone(), len).is_some_and(|old| {
             inner.total = inner.total.saturating_sub(old);
-        } else {
-            inner.order.push_back(key);
+            true
+        });
+        if !replaced || matches!(self.eviction, Eviction::Lru) {
+            inner.insert_ticket(key);
         }
         inner.total = inner.total.saturating_add(len);
         if let Some(budget) = self.budget {
             while inner.total > budget.get() {
-                let Some(oldest) = inner.order.pop_front() else {
+                let Some(oldest) = inner.pop_oldest() else {
                     break;
                 };
                 // Map before unlinking: the unlinked inode stays alive
@@ -301,8 +452,9 @@ impl TierWrite for MmapDiskTier {
                     .maps
                     .remove(&oldest)
                     .or_else(|| Self::map_file(&old_path).ok().flatten());
-                if let Some(size) = inner.sizes.remove(&oldest) {
-                    inner.total = inner.total.saturating_sub(size);
+                if let Some(size) = inner.remove_accounting(&oldest) {
+                    inner.evictions = inner.evictions.saturating_add(1);
+                    inner.evicted_bytes = inner.evicted_bytes.saturating_add(size);
                 }
                 let _ = fs::remove_file(&old_path);
                 if let Some(bytes) = bytes {
@@ -319,11 +471,8 @@ impl TierWrite for MmapDiskTier {
     async fn delete(&self, key: &String) -> io::Result<bool> {
         {
             let mut inner = self.lock();
-            inner.maps.remove(key);
-            if let Some(size) = inner.sizes.remove(key) {
-                inner.total = inner.total.saturating_sub(size);
-                inner.order.retain(|k| k != key);
-            }
+            inner.remove_accounting(key);
+            inner.compact_tickets();
         }
         match fs::remove_file(self.path_for(key)) {
             Ok(()) => Ok(true),
@@ -486,6 +635,37 @@ mod tests {
         assert_eq!(displaced[0].1.as_ref(), b"aaaa");
         assert_eq!(block_on(tier.get(&key("a"))).expect("get a"), None);
         assert_eq!(tier.disk_usage(), 8);
+        assert_eq!(
+            tier.stats(),
+            MmapDiskStats {
+                entries: 2,
+                mapped_entries: 2,
+                disk_bytes: 8,
+                budget_bytes: Some(10),
+                evictions: 1,
+                evicted_bytes: 4,
+            }
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bounded_lru_keeps_a_recently_read_entry() {
+        let root = temp_root("bounded-lru");
+        let _ = fs::remove_dir_all(&root);
+        let tier = MmapDiskTier::open_bounded(&root, NonZeroU64::new(10).expect("nonzero"))
+            .expect("open")
+            .with_eviction(Eviction::Lru);
+
+        block_on(tier.put(key("a"), Bytes::from_static(b"aaaa"))).expect("put a");
+        block_on(tier.put(key("b"), Bytes::from_static(b"bbbb"))).expect("put b");
+        assert!(block_on(tier.get(&key("a"))).expect("touch a").is_some());
+        let displaced = block_on(tier.put(key("c"), Bytes::from_static(b"cccc"))).expect("put c");
+
+        assert_eq!(displaced[0].0, key("b"), "the untouched entry is LRU");
+        assert!(block_on(tier.get(&key("a"))).expect("get a").is_some());
+        assert!(block_on(tier.get(&key("b"))).expect("get b").is_none());
+        assert_eq!(tier.stats().evictions, 1);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -501,6 +681,14 @@ mod tests {
         let tier = MmapDiskTier::open_bounded(&root, NonZeroU64::new(10).expect("nonzero"))
             .expect("reopen");
         assert_eq!(tier.disk_usage(), 8, "accounting must rebuild from disk");
+        assert_eq!(tier.stats().entries, 2);
+        assert_eq!(
+            tier.stats().mapped_entries,
+            0,
+            "observing stats must not fault or map entry bodies"
+        );
+        assert!(block_on(tier.get(&key("x"))).expect("get x").is_some());
+        assert_eq!(tier.stats().mapped_entries, 1);
         // Overflow evicts entries whose accounting was rebuilt from disk.
         let displaced = block_on(tier.put(key("z"), Bytes::from_static(b"zzzz"))).expect("put z");
         assert_eq!(displaced.len(), 1);

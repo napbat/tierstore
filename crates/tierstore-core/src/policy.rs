@@ -4,6 +4,21 @@
 //! The same router becomes an inclusive read-through cache, an exclusive
 //! rollover cache, or a plain fallback chain purely by changing [`Policy`].
 
+/// Eviction ordering for bounded cache tiers.
+///
+/// This lives in the core crate so hot-memory and warm-disk adapters expose
+/// the same policy type and the same read/replacement semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Eviction {
+    /// Evict in insertion order; reads do not affect eviction. Replacing a
+    /// value keeps its queue position.
+    #[default]
+    Fifo,
+    /// Evict the least recently *used* entry: reads and replacements refresh
+    /// recency. Existence checks do not.
+    Lru,
+}
+
 /// What to do with a value found below the top tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Promote {

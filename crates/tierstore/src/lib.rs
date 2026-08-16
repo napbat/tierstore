@@ -55,15 +55,15 @@ pub use codec::{CodecError, CodecTier};
 pub use disk::DiskTier;
 pub use error::{BoxError, RouterError, TierFailure};
 pub use limited::LimitedTier;
-pub use memory::{Eviction, MemoryRef, MemoryTier};
+pub use memory::{MemoryRef, MemoryTier};
 pub use offload::OffloadTier;
 pub use report::{DeleteReport, KeyStatus, ReadReport};
 pub use router::{Router, RouterBuilder, TierStats};
 pub use single_flight::{SingleFlight, SingleFlightGuard};
 pub use store::{StoreError, TieredStore, TieredStoreBuilder};
 pub use tierstore_core::{
-    Displaced, OnReadError, OnWriteError, Page, Policy, Probe, Promote, ReadFlow, ReadOutcome,
-    ReadPolicy, ReadStep, Tier, TierList, TierRead, TierReadRange, TierReadRef, TierWrite,
-    WriteMode,
+    Displaced, Eviction, OnReadError, OnWriteError, Page, Policy, Probe, Promote, ReadFlow,
+    ReadOutcome, ReadPolicy, ReadStep, Tier, TierList, TierRead, TierReadRange, TierReadRef,
+    TierWrite, WriteMode,
 };
 pub use verified::{VerifiedTier, VerifyError};

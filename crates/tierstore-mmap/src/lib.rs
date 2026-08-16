@@ -24,10 +24,11 @@
 //! # Bounding disk
 //!
 //! [`MmapDiskTier::open_bounded`] caps the accounted bytes on disk: puts
-//! that overflow the budget FIFO-evict the oldest entries and return them
-//! as displaced — mapped from the evicted files themselves (an unlinked
-//! inode stays readable while mapped), so rollover demotion is zero-copy.
-//! Accounting is rebuilt from file sizes and mtimes on reopen.
+//! that overflow the budget evict the oldest entries (FIFO by default, or
+//! access-aware LRU with `with_eviction`) and return them as displaced —
+//! mapped from the evicted files themselves (an unlinked inode stays readable
+//! while mapped), so rollover demotion is zero-copy. Accounting is rebuilt
+//! from file sizes and mtimes on reopen.
 //!
 //! # Example
 //!
@@ -48,4 +49,4 @@
 
 mod tier;
 
-pub use tier::MmapDiskTier;
+pub use tier::{MmapDiskStats, MmapDiskTier};
