@@ -57,7 +57,7 @@ pub use error::{BoxError, RouterError, TierFailure};
 pub use limited::LimitedTier;
 pub use memory::{MemoryRef, MemoryTier};
 pub use offload::OffloadTier;
-pub use report::{DeleteReport, KeyStatus, ReadReport};
+pub use report::{DeleteReport, KeyStatus, ReadOneReport, ReadReport};
 pub use router::{Router, RouterBuilder, TierStats};
 pub use single_flight::{SingleFlight, SingleFlightGuard};
 pub use store::{StoreError, TieredStore, TieredStoreBuilder};

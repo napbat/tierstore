@@ -22,7 +22,7 @@ use tierstore_core::{
 };
 
 use crate::error::RouterError;
-use crate::report::{DeleteReport, ReadReport};
+use crate::report::{DeleteReport, KeyStatus, ReadOneReport, ReadReport};
 use crate::router::{Router, RouterBuilder};
 use crate::single_flight::SingleFlight;
 
@@ -106,13 +106,33 @@ where
     /// failed (absence unconfirmed), or [`RouterError::Tier`] under
     /// fail-fast policies.
     pub async fn get(&self, key: &K) -> Result<Option<V>, RouterError> {
+        let report = self.lookup(key).await?;
+        match report.status {
+            KeyStatus::Hit { value, .. } => Ok(Some(value)),
+            KeyStatus::Miss => Ok(None),
+            KeyStatus::Inconclusive => Err(RouterError::Inconclusive(report.failures)),
+        }
+    }
+
+    /// Reads through the hierarchy with serving-tier provenance and routed
+    /// failures preserved in a single-key report.
+    ///
+    /// This has the same promotion and single-flight behaviour as [`Self::get`],
+    /// but leaves the miss/inconclusive distinction and hit tier visible for
+    /// callers that attribute hot, warm, and cold service.
+    ///
+    /// # Errors
+    ///
+    /// [`RouterError::Tier`] under a fail-fast read policy. Fall-through
+    /// failures are carried in [`ReadOneReport::failures`].
+    pub async fn lookup(&self, key: &K) -> Result<ReadOneReport<V>, RouterError> {
         if !self.single_flight {
-            return self.router.get(key).await;
+            return self.router.read_one(key).await;
         }
         let gate = self.gates.acquire(key.clone()).await;
-        let result = self.router.get(key).await;
-        // Held through the fill on purpose: waiters must observe the
-        // promoted value, not race the origin fetch.
+        let result = self.router.read_one(key).await;
+        // Held through promotion on purpose: waiters must observe the value
+        // in the tier it was promoted into rather than race the lower read.
         drop(gate);
         result
     }
