@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{CountingTier, SlowTier, block_on};
+use common::{CountingTier, FailingTier, SlowTier, block_on};
 use tierstore::{
     DiskTier, KeyStatus, MemoryTier, RouterError, TierRead, TierWrite, TieredCache, VerifiedTier,
 };
@@ -143,6 +143,24 @@ fn batched_cache_round_trip() {
         block_on(cache.get(&key("a"))).expect("get after invalidate"),
         None
     );
+}
+
+#[test]
+fn single_lookup_reports_serving_tier_and_routed_failures() {
+    let cold = Arc::new(MemoryTier::unbounded());
+    block_on(cold.put(key("k"), val("v"))).expect("seed cold");
+    let cache = TieredCache::builder()
+        .tier(FailingTier::<String, Vec<u8>>::default())
+        .tier(Arc::clone(&cold))
+        .single_flight(false)
+        .build();
+
+    let report = block_on(cache.lookup(&key("k"))).expect("lookup");
+    assert_eq!(report.status.tier(), Some(1));
+    assert_eq!(report.value(), Some(&val("v")));
+    assert!(!report.is_complete());
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].tier(), 0);
 }
 
 #[test]

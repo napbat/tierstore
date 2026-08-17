@@ -19,7 +19,7 @@ use tierstore_core::{
 };
 
 use crate::error::{BoxError, RouterError, TierFailure};
-use crate::report::{DeleteReport, KeyStatus, ReadReport};
+use crate::report::{DeleteReport, KeyStatus, ReadOneReport, ReadReport};
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -428,11 +428,14 @@ where
     /// # Errors
     ///
     /// Only under [`OnReadError::FailFast`], like `read_many`.
-    pub async fn read_one(&self, key: &K) -> Result<(KeyStatus<V>, Vec<TierFailure>), RouterError> {
+    pub async fn read_one(&self, key: &K) -> Result<ReadOneReport<V>, RouterError> {
         let mut report = self.read_many(std::slice::from_ref(key)).await?;
         // One key in, one status out; the fallback is unreachable.
         let status = report.statuses.pop().unwrap_or(KeyStatus::Miss);
-        Ok((status, report.failures))
+        Ok(ReadOneReport {
+            status,
+            failures: report.failures,
+        })
     }
 
     /// Batched delete with per-key outcomes. Every *writable* tier is

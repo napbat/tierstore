@@ -26,6 +26,16 @@ pub enum KeyStatus<V> {
 }
 
 impl<V> KeyStatus<V> {
+    /// Index of the tier that served this key, or `None` for a miss or an
+    /// inconclusive lookup.
+    #[must_use]
+    pub const fn tier(&self) -> Option<usize> {
+        match self {
+            Self::Hit { tier, .. } => Some(*tier),
+            Self::Miss | Self::Inconclusive => None,
+        }
+    }
+
     /// The value, if this key hit.
     #[must_use]
     pub const fn value(&self) -> Option<&V> {
@@ -42,6 +52,41 @@ impl<V> KeyStatus<V> {
             Self::Hit { value, .. } => Some(value),
             Self::Miss | Self::Inconclusive => None,
         }
+    }
+}
+
+/// Result of a single-key read, including the tier that served a hit and any
+/// failures the read policy routed around.
+///
+/// This is the ergonomic single-key counterpart to [`ReadReport`]. It keeps
+/// cache provenance on the cache facade, so consumers that attribute hot,
+/// warm, and cold hits do not need to reach through to the underlying router
+/// or unpack an ad-hoc tuple.
+#[derive(Debug)]
+pub struct ReadOneReport<V> {
+    /// The key's resolved status and serving-tier provenance.
+    pub status: KeyStatus<V>,
+    /// Tiers that failed while probing. Empty means the status is complete.
+    pub failures: Vec<TierFailure>,
+}
+
+impl<V> ReadOneReport<V> {
+    /// Whether every tier needed by the lookup answered.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    /// The value, if the lookup hit.
+    #[must_use]
+    pub const fn value(&self) -> Option<&V> {
+        self.status.value()
+    }
+
+    /// Consumes the report, returning the value if the lookup hit.
+    #[must_use]
+    pub fn into_value(self) -> Option<V> {
+        self.status.into_value()
     }
 }
 
