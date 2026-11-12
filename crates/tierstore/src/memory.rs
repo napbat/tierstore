@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
+use std::future::ready;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -374,23 +375,25 @@ impl<K, V> Tier for MemoryTier<K, V> {
     }
 }
 
+// Each operation finishes under the lock, so each future is ready when it is
+// created.
 impl<K, V> TierRead for MemoryTier<K, V>
 where
     K: Eq + Hash + Clone + Send + Sync,
     V: Clone + Send + Sync,
 {
-    async fn get(&self, key: &K) -> Result<Option<V>, Infallible> {
-        Ok(self.lock().fetch(key, self.eviction))
+    fn get(&self, key: &K) -> impl Future<Output = Result<Option<V>, Infallible>> {
+        ready(Ok(self.lock().fetch(key, self.eviction)))
     }
 
     /// Existence checks do not refresh LRU recency.
-    async fn exists(&self, key: &K) -> Result<bool, Infallible> {
-        Ok(self.lock().map.contains_key(key))
+    fn exists(&self, key: &K) -> impl Future<Output = Result<bool, Infallible>> {
+        ready(Ok(self.lock().map.contains_key(key)))
     }
 
     /// One lock acquisition for the whole batch, instead of one per key.
-    async fn get_many(&self, keys: &[K]) -> Result<Vec<Option<V>>, Infallible> {
-        Ok(self.lock().fetch_batch(keys, self.eviction))
+    fn get_many(&self, keys: &[K]) -> impl Future<Output = Result<Vec<Option<V>>, Infallible>> {
+        ready(Ok(self.lock().fetch_batch(keys, self.eviction)))
     }
 }
 
@@ -430,6 +433,10 @@ where
     where
         Self: 'a;
 
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "a ready future would take the lock when it is created, and the guard is not Send"
+    )]
     async fn get_ref<'s>(&'s self, key: &K) -> Result<Option<MemoryRef<'s, K, V>>, Infallible> {
         let mut guard = self.lock();
         if guard.map.contains_key(key) {
@@ -451,19 +458,26 @@ where
     K: Eq + Hash + Clone + Send + Sync,
     V: Clone + Send + Sync,
 {
-    async fn put(&self, key: K, value: V) -> Result<Displaced<K, V>, Infallible> {
+    fn put(&self, key: K, value: V) -> impl Future<Output = Result<Displaced<K, V>, Infallible>> {
         let weight = self.weight_of(&key, &value);
-        Ok(self
-            .lock()
-            .insert(key, value, weight, self.limits(), self.eviction))
+        ready(Ok(self.lock().insert(
+            key,
+            value,
+            weight,
+            self.limits(),
+            self.eviction,
+        )))
     }
 
-    async fn delete(&self, key: &K) -> Result<bool, Infallible> {
-        Ok(self.lock().remove(key))
+    fn delete(&self, key: &K) -> impl Future<Output = Result<bool, Infallible>> {
+        ready(Ok(self.lock().remove(key)))
     }
 
     /// One lock acquisition for the whole batch, instead of one per entry.
-    async fn put_many(&self, entries: Vec<(K, V)>) -> Result<Displaced<K, V>, Infallible> {
+    fn put_many(
+        &self,
+        entries: Vec<(K, V)>,
+    ) -> impl Future<Output = Result<Displaced<K, V>, Infallible>> {
         let weighted: Vec<(K, V, usize)> = entries
             .into_iter()
             .map(|(key, value)| {
@@ -471,14 +485,16 @@ where
                 (key, value, weight)
             })
             .collect();
-        Ok(self
-            .lock()
-            .insert_batch(weighted, self.limits(), self.eviction))
+        ready(Ok(self.lock().insert_batch(
+            weighted,
+            self.limits(),
+            self.eviction,
+        )))
     }
 
     /// One lock acquisition for the whole batch, instead of one per key.
-    async fn delete_many(&self, keys: &[K]) -> Result<Vec<bool>, Infallible> {
-        Ok(self.lock().remove_batch(keys))
+    fn delete_many(&self, keys: &[K]) -> impl Future<Output = Result<Vec<bool>, Infallible>> {
+        ready(Ok(self.lock().remove_batch(keys)))
     }
 }
 
@@ -489,12 +505,12 @@ where
 {
     type Cursor = usize;
 
-    async fn list(
+    fn list(
         &self,
         cursor: Option<usize>,
         limit: usize,
-    ) -> Result<Page<K, usize>, Infallible> {
-        Ok(self.lock().page(cursor, limit))
+    ) -> impl Future<Output = Result<Page<K, usize>, Infallible>> {
+        ready(Ok(self.lock().page(cursor, limit)))
     }
 }
 

@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs;
+use std::future::ready;
 use std::io;
 use std::num::NonZeroU64;
 use std::ops::Range;
@@ -342,8 +343,8 @@ impl Tier for MmapDiskTier {
     }
 }
 
-impl TierRead for MmapDiskTier {
-    async fn get(&self, key: &String) -> io::Result<Option<Bytes>> {
+impl MmapDiskTier {
+    fn get_blocking(&self, key: &str) -> io::Result<Option<Bytes>> {
         // Bind before branching so the map lock is not held past the probe.
         let cached = {
             let mut inner = self.lock();
@@ -365,7 +366,7 @@ impl TierRead for MmapDiskTier {
             // mapped. Return this snapshot to the in-flight reader, but do
             // not resurrect it in the retained mapping/accounting index.
             if inner.sizes.contains_key(key) {
-                inner.maps.insert(key.clone(), bytes.clone());
+                inner.maps.insert(key.to_owned(), bytes.clone());
                 if matches!(self.eviction, Eviction::Lru) {
                     inner.touch(key);
                 }
@@ -373,12 +374,20 @@ impl TierRead for MmapDiskTier {
         }
         Ok(mapped)
     }
+}
 
-    async fn exists(&self, key: &String) -> io::Result<bool> {
-        if self.lock().maps.contains_key(key) {
-            return Ok(true);
-        }
-        self.path_for(key).try_exists()
+// The I/O is synchronous, so each future is ready when it is created.
+impl TierRead for MmapDiskTier {
+    fn get(&self, key: &String) -> impl Future<Output = io::Result<Option<Bytes>>> {
+        ready(self.get_blocking(key))
+    }
+
+    fn exists(&self, key: &String) -> impl Future<Output = io::Result<bool>> {
+        ready(if self.lock().maps.contains_key(key) {
+            Ok(true)
+        } else {
+            self.path_for(key).try_exists()
+        })
     }
 }
 
@@ -407,12 +416,8 @@ impl TierReadRange for MmapDiskTier {
     }
 }
 
-impl TierWrite for MmapDiskTier {
-    /// Writes via temp-file-then-rename, then remaps: the cached value is
-    /// file-backed, so the caller's (anonymous-RAM) input can be dropped
-    /// and residency shifts to evictable page cache immediately. Under a
-    /// budget, overflow evicts in the configured order and returns them.
-    async fn put(&self, key: String, value: Bytes) -> io::Result<Displaced<String, Bytes>> {
+impl MmapDiskTier {
+    fn put_blocking(&self, key: String, value: Bytes) -> io::Result<Displaced<String, Bytes>> {
         let path = self.path_for(&key);
         // Hex names contain no `.`, so the temp name cannot collide with a
         // real entry (and `list` skips anything that fails hex decoding).
@@ -468,24 +473,11 @@ impl TierWrite for MmapDiskTier {
         Ok(displaced)
     }
 
-    async fn delete(&self, key: &String) -> io::Result<bool> {
-        {
-            let mut inner = self.lock();
-            inner.remove_accounting(key);
-            inner.compact_tickets();
-        }
-        match fs::remove_file(self.path_for(key)) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-}
-
-impl TierList for MmapDiskTier {
-    type Cursor = usize;
-
-    async fn list(&self, cursor: Option<usize>, limit: usize) -> io::Result<Page<String, usize>> {
+    fn list_blocking(
+        &self,
+        cursor: Option<usize>,
+        limit: usize,
+    ) -> io::Result<Page<String, usize>> {
         let mut all = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
@@ -509,6 +501,45 @@ impl TierList for MmapDiskTier {
         let end = offset.saturating_add(keys.len());
         let next = (limit > 0 && end < all.len()).then_some(end);
         Ok(Page { keys, next })
+    }
+}
+
+impl TierWrite for MmapDiskTier {
+    /// Writes via temp-file-then-rename, then remaps: the cached value is
+    /// file-backed, so the caller's (anonymous-RAM) input can be dropped
+    /// and residency shifts to evictable page cache immediately. Under a
+    /// budget, overflow evicts in the configured order and returns them.
+    fn put(
+        &self,
+        key: String,
+        value: Bytes,
+    ) -> impl Future<Output = io::Result<Displaced<String, Bytes>>> {
+        ready(self.put_blocking(key, value))
+    }
+
+    fn delete(&self, key: &String) -> impl Future<Output = io::Result<bool>> {
+        {
+            let mut inner = self.lock();
+            inner.remove_accounting(key);
+            inner.compact_tickets();
+        }
+        ready(match fs::remove_file(self.path_for(key)) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        })
+    }
+}
+
+impl TierList for MmapDiskTier {
+    type Cursor = usize;
+
+    fn list(
+        &self,
+        cursor: Option<usize>,
+        limit: usize,
+    ) -> impl Future<Output = io::Result<Page<String, usize>>> {
+        ready(self.list_blocking(cursor, limit))
     }
 }
 

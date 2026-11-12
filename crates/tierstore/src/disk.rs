@@ -2,6 +2,7 @@
 
 use std::fmt::Write as _;
 use std::fs;
+use std::future::ready;
 use std::io;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -88,24 +89,8 @@ impl Tier for DiskTier {
     }
 }
 
-impl TierRead for DiskTier {
-    async fn get(&self, key: &String) -> io::Result<Option<Vec<u8>>> {
-        match fs::read(self.path_for(key)) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    async fn exists(&self, key: &String) -> io::Result<bool> {
-        self.path_for(key).try_exists()
-    }
-}
-
-impl TierReadRange for DiskTier {
-    /// One positional read of exactly the requested bytes — the whole value
-    /// is never materialised.
-    async fn read_range(&self, key: &String, range: Range<u64>) -> io::Result<Option<Vec<u8>>> {
+impl DiskTier {
+    fn read_range_blocking(&self, key: &str, range: Range<u64>) -> io::Result<Option<Vec<u8>>> {
         use std::io::{Read as _, Seek as _, SeekFrom};
         if range.start > range.end {
             return Err(io::Error::new(
@@ -125,32 +110,21 @@ impl TierReadRange for DiskTier {
         file.read_exact(&mut buf)?;
         Ok(Some(buf))
     }
-}
 
-impl TierWrite for DiskTier {
-    async fn put(&self, key: String, value: Vec<u8>) -> io::Result<Displaced<String, Vec<u8>>> {
-        let path = self.path_for(&key);
+    fn put_blocking(&self, key: &str, value: &[u8]) -> io::Result<()> {
+        let path = self.path_for(key);
         // Hex names contain no `.`, so the temp name cannot collide with a
         // real entry (and `list` skips anything that fails hex decoding).
         let tmp = path.with_extension("tmp");
-        fs::write(&tmp, &value)?;
-        fs::rename(&tmp, &path)?;
-        Ok(Displaced::new())
+        fs::write(&tmp, value)?;
+        fs::rename(&tmp, &path)
     }
 
-    async fn delete(&self, key: &String) -> io::Result<bool> {
-        match fs::remove_file(self.path_for(key)) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-}
-
-impl TierList for DiskTier {
-    type Cursor = usize;
-
-    async fn list(&self, cursor: Option<usize>, limit: usize) -> io::Result<Page<String, usize>> {
+    fn list_blocking(
+        &self,
+        cursor: Option<usize>,
+        limit: usize,
+    ) -> io::Result<Page<String, usize>> {
         let mut all = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let name = entry?.file_name();
@@ -170,6 +144,63 @@ impl TierList for DiskTier {
         let end = offset.saturating_add(keys.len());
         let next = (limit > 0 && end < all.len()).then_some(end);
         Ok(Page { keys, next })
+    }
+}
+
+// The I/O is synchronous, so each future is ready when it is created.
+impl TierRead for DiskTier {
+    fn get(&self, key: &String) -> impl Future<Output = io::Result<Option<Vec<u8>>>> {
+        ready(match fs::read(self.path_for(key)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        })
+    }
+
+    fn exists(&self, key: &String) -> impl Future<Output = io::Result<bool>> {
+        ready(self.path_for(key).try_exists())
+    }
+}
+
+impl TierReadRange for DiskTier {
+    /// One positional read of exactly the requested bytes — the whole value
+    /// is never materialised.
+    fn read_range(
+        &self,
+        key: &String,
+        range: Range<u64>,
+    ) -> impl Future<Output = io::Result<Option<Vec<u8>>>> {
+        ready(self.read_range_blocking(key, range))
+    }
+}
+
+impl TierWrite for DiskTier {
+    fn put(
+        &self,
+        key: String,
+        value: Vec<u8>,
+    ) -> impl Future<Output = io::Result<Displaced<String, Vec<u8>>>> {
+        ready(self.put_blocking(&key, &value).map(|()| Displaced::new()))
+    }
+
+    fn delete(&self, key: &String) -> impl Future<Output = io::Result<bool>> {
+        ready(match fs::remove_file(self.path_for(key)) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        })
+    }
+}
+
+impl TierList for DiskTier {
+    type Cursor = usize;
+
+    fn list(
+        &self,
+        cursor: Option<usize>,
+        limit: usize,
+    ) -> impl Future<Output = io::Result<Page<String, usize>>> {
+        ready(self.list_blocking(cursor, limit))
     }
 }
 

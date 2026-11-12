@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::future::Future;
+use std::future::{Future, ready};
 use std::hash::Hash;
 use std::io;
 use std::marker::PhantomData;
@@ -49,12 +49,12 @@ where
     K: Eq + Hash + Sync,
     V: Clone + Send + Sync,
 {
-    async fn get(&self, key: &K) -> Result<Option<V>, Infallible> {
-        Ok(self.data.get(key).cloned())
+    fn get(&self, key: &K) -> impl Future<Output = Result<Option<V>, Infallible>> {
+        ready(Ok(self.data.get(key).cloned()))
     }
 
-    async fn exists(&self, key: &K) -> Result<bool, Infallible> {
-        Ok(self.data.contains_key(key))
+    fn exists(&self, key: &K) -> impl Future<Output = Result<bool, Infallible>> {
+        ready(Ok(self.data.contains_key(key)))
     }
 }
 
@@ -86,22 +86,22 @@ impl<K, V> Tier for FailingTier<K, V> {
 }
 
 impl<K: Sync, V: Send + Sync> TierRead for FailingTier<K, V> {
-    async fn get(&self, _key: &K) -> io::Result<Option<V>> {
-        Err(io::Error::other("failing tier: get"))
+    fn get(&self, _key: &K) -> impl Future<Output = io::Result<Option<V>>> {
+        ready(Err(io::Error::other("failing tier: get")))
     }
 
-    async fn exists(&self, _key: &K) -> io::Result<bool> {
-        Err(io::Error::other("failing tier: exists"))
+    fn exists(&self, _key: &K) -> impl Future<Output = io::Result<bool>> {
+        ready(Err(io::Error::other("failing tier: exists")))
     }
 }
 
 impl<K: Send + Sync, V: Send + Sync> TierWrite for FailingTier<K, V> {
-    async fn put(&self, _key: K, _value: V) -> io::Result<Displaced<K, V>> {
-        Err(io::Error::other("failing tier: put"))
+    fn put(&self, _key: K, _value: V) -> impl Future<Output = io::Result<Displaced<K, V>>> {
+        ready(Err(io::Error::other("failing tier: put")))
     }
 
-    async fn delete(&self, _key: &K) -> io::Result<bool> {
-        Err(io::Error::other("failing tier: delete"))
+    fn delete(&self, _key: &K) -> impl Future<Output = io::Result<bool>> {
+        ready(Err(io::Error::other("failing tier: delete")))
     }
 }
 

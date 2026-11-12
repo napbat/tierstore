@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
+use std::future::ready;
 use std::io;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -232,13 +233,15 @@ impl Tier for SlotMmapTier {
     }
 }
 
+// Each operation finishes under the lock, so each future is ready when it is
+// created.
 impl TierRead for SlotMmapTier {
-    async fn get(&self, key: &String) -> io::Result<Option<Vec<u8>>> {
-        Ok(self.lock().fetch(key))
+    fn get(&self, key: &String) -> impl Future<Output = io::Result<Option<Vec<u8>>>> {
+        ready(Ok(self.lock().fetch(key)))
     }
 
-    async fn exists(&self, key: &String) -> io::Result<bool> {
-        Ok(self.lock().index.contains_key(key))
+    fn exists(&self, key: &String) -> impl Future<Output = io::Result<bool>> {
+        ready(Ok(self.lock().index.contains_key(key)))
     }
 }
 
@@ -274,6 +277,10 @@ impl TierReadRef for SlotMmapTier {
     where
         Self: 'a;
 
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "a ready future would take the lock when it is created, and the guard is not Send"
+    )]
     async fn get_ref<'s>(&'s self, key: &String) -> io::Result<Option<MmapRef<'s>>> {
         let guard = self.lock();
         let Some(&slot) = guard.index.get(key) else {
@@ -287,11 +294,15 @@ impl TierReadRef for SlotMmapTier {
 }
 
 impl TierWrite for SlotMmapTier {
-    async fn put(&self, key: String, value: Vec<u8>) -> io::Result<Displaced<String, Vec<u8>>> {
-        self.lock().insert(key, &value)
+    fn put(
+        &self,
+        key: String,
+        value: Vec<u8>,
+    ) -> impl Future<Output = io::Result<Displaced<String, Vec<u8>>>> {
+        ready(self.lock().insert(key, &value))
     }
 
-    async fn delete(&self, key: &String) -> io::Result<bool> {
-        Ok(self.lock().remove(key))
+    fn delete(&self, key: &String) -> impl Future<Output = io::Result<bool>> {
+        ready(Ok(self.lock().remove(key)))
     }
 }
