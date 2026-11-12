@@ -2,6 +2,7 @@
 
 use std::convert::Infallible;
 use std::fmt;
+use std::future::ready;
 use std::hash::Hash;
 
 use tierstore_core::{Displaced, Tier, TierRead, TierWrite};
@@ -82,8 +83,8 @@ where
     }
 
     /// Existence checks do not refresh recency/frequency.
-    async fn exists(&self, key: &K) -> Result<bool, Infallible> {
-        Ok(self.cache.contains_key(key))
+    fn exists(&self, key: &K) -> impl Future<Output = Result<bool, Infallible>> {
+        ready(Ok(self.cache.contains_key(key)))
     }
 }
 

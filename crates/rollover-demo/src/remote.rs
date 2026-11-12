@@ -3,6 +3,7 @@
 //! can prove which reads actually crossed the "network".
 
 use std::collections::HashMap;
+use std::future::ready;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -52,28 +53,33 @@ impl Tier for RemoteStore {
     }
 }
 
+// The simulated round trip blocks, so each future is ready when it is created.
 impl TierRead for RemoteStore {
-    async fn get(&self, key: &String) -> io::Result<Option<Vec<u8>>> {
+    fn get(&self, key: &String) -> impl Future<Output = io::Result<Option<Vec<u8>>>> {
         self.round_trip();
         self.fetches.fetch_add(1, Ordering::Relaxed);
-        Ok(self.lock().get(key).cloned())
+        ready(Ok(self.lock().get(key).cloned()))
     }
 
-    async fn exists(&self, key: &String) -> io::Result<bool> {
+    fn exists(&self, key: &String) -> impl Future<Output = io::Result<bool>> {
         self.round_trip();
-        Ok(self.lock().contains_key(key))
+        ready(Ok(self.lock().contains_key(key)))
     }
 }
 
 impl TierWrite for RemoteStore {
-    async fn put(&self, key: String, value: Vec<u8>) -> io::Result<Displaced<String, Vec<u8>>> {
+    fn put(
+        &self,
+        key: String,
+        value: Vec<u8>,
+    ) -> impl Future<Output = io::Result<Displaced<String, Vec<u8>>>> {
         self.round_trip();
         self.lock().insert(key, value);
-        Ok(Displaced::new())
+        ready(Ok(Displaced::new()))
     }
 
-    async fn delete(&self, key: &String) -> io::Result<bool> {
+    fn delete(&self, key: &String) -> impl Future<Output = io::Result<bool>> {
         self.round_trip();
-        Ok(self.lock().remove(key).is_some())
+        ready(Ok(self.lock().remove(key).is_some()))
     }
 }
